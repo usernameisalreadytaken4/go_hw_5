@@ -1,6 +1,9 @@
 package main
 
+// сгенеренный код
+
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"slices"
@@ -12,7 +15,10 @@ func ProfileParamsValidator(r *http.Request) error {
 	// required
 	data.Login = r.URL.Query().Get("login")
 	if data.Login == "" {
-		return errors.New("login must me not empty")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("login must me not empty"),
+		}
 	}
 
 	return nil
@@ -24,14 +30,20 @@ func CreateParamsValidator(r *http.Request) error {
 	// required
 	data.Login = r.URL.Query().Get("login")
 	if data.Login == "" {
-		return errors.New("login must me not empty")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("login must me not empty"),
+		}
 	}
 
 	// enum
 	enums := []string{"user, moderator, admin"}
 	data.Status = r.URL.Query().Get("status")
 	if !slices.Contains(enums, data.Status) {
-		return errors.New("status must be one of [user, moderator, admin]")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("status must be one of [user, moderator, admin]"),
+		}
 	}
 
 	// default
@@ -44,8 +56,18 @@ func CreateParamsValidator(r *http.Request) error {
 }
 
 func MyApiUserProfile(w http.ResponseWriter, r *http.Request) {
+	err := ProfileParamsValidator(r)
 
-	// some shit
+	if err != nil {
+		apiError, ok := err.(ApiError)
+		if ok {
+			w.WriteHeader(apiError.HTTPStatus)
+			jsonRaw, _ := json.Marshal(err)
+			w.Write([]byte(jsonRaw))
+			return
+		}
+	}
+
 }
 
 func MyApiUserCreate(w http.ResponseWriter, r *http.Request) {
@@ -54,8 +76,18 @@ func MyApiUserCreate(w http.ResponseWriter, r *http.Request) {
 	if auth != "100500" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
+	err := CreateParamsValidator(r)
 
-	// some shit
+	if err != nil {
+		apiError, ok := err.(ApiError)
+		if ok {
+			w.WriteHeader(apiError.HTTPStatus)
+			jsonRaw, _ := json.Marshal(err)
+			w.Write([]byte(jsonRaw))
+			return
+		}
+	}
+
 }
 
 func OtherCreateParamsValidator(r *http.Request) error {
@@ -64,14 +96,20 @@ func OtherCreateParamsValidator(r *http.Request) error {
 	// required
 	data.Username = r.URL.Query().Get("username")
 	if data.Username == "" {
-		return errors.New("username must me not empty")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("username must me not empty"),
+		}
 	}
 
 	// enum
 	enums := []string{"warrior, sorcerer, rouge"}
 	data.Class = r.URL.Query().Get("class")
 	if !slices.Contains(enums, data.Class) {
-		return errors.New("class must be one of [warrior, sorcerer, rouge]")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("class must be one of [warrior, sorcerer, rouge]"),
+		}
 	}
 
 	// default
@@ -89,6 +127,16 @@ func OtherApiUserCreate(w http.ResponseWriter, r *http.Request) {
 	if auth != "100500" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
+	err := CreateParamsValidator(r)
 
-	// some shit
+	if err != nil {
+		apiError, ok := err.(ApiError)
+		if ok {
+			w.WriteHeader(apiError.HTTPStatus)
+			jsonRaw, _ := json.Marshal(err)
+			w.Write([]byte(jsonRaw))
+			return
+		}
+	}
+
 }

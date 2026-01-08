@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"go/ast"
@@ -54,6 +55,28 @@ func CloseForm(out *os.File) {
 
 }
 
+type ApiError struct {
+	HTTPStatus int
+	Err        error
+}
+
+func ApiErrorTemplate() string {
+	template := template.Must(template.New("apiErrorTpl").Parse(`
+	if err != nil {
+		apiError, ok := err.(ApiError)
+		if ok {
+			w.WriteHeader(apiError.HTTPStatus)
+			jsonRaw, _ := json.Marshal(err)
+			w.Write([]byte(jsonRaw))
+			return
+		}
+	}
+	`))
+	var buf bytes.Buffer
+	template.Execute(&buf, nil)
+	return buf.String()
+}
+
 type FieldMeta struct {
 	// * `required` - поле не должно быть пустым (не должно иметь значение по-умолчанию)
 	// * `paramname` - если указано - то брать из параметра с этим именем, иначе `lowercase` от имени
@@ -75,7 +98,10 @@ func (field *FieldMeta) RequiredCheck(out *os.File) {
 	// required
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if data.{{.FieldName}} == "" {
-		return errors.New("{{.ParamName}} must me not empty")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err: errors.New("{{.ParamName}} must me not empty"),
+		}
 	}
 	`))
 	template.Execute(out, tpl{
@@ -90,7 +116,10 @@ func (field *FieldMeta) EnumCheck(out *os.File) {
 	enums := []string{"{{.Body}}"}
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if !slices.Contains(enums, data.{{.FieldName}}) {
-		return errors.New("{{.ParamName}} must be one of [{{.Body}}]")
+		return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err: errors.New("{{.ParamName}} must be one of [{{.Body}}]"),
+		}
 	}
 	`))
 	template.Execute(out, tpl{
@@ -120,7 +149,10 @@ func (field *FieldMeta) MinMaxCheck(out *os.File, op string, limit int) {
 	// min/max
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if data.{{.FieldName}} != "" && len(data.{{.FieldName}}) {{.Body}} {{.IntValue}} {
-	    return errors.New("{{.ParamName}} must be {{.Body}}= {{.IntValue}}")
+	    return ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err: errors.New()"{{.ParamName}} must be {{.Body}}= {{.IntValue}}"),
+		}
 	}
 	`))
 
@@ -144,6 +176,7 @@ func (field *FieldMeta) MaxCheck(out *os.File) {
 }
 
 type tpl struct {
+	ApiName     string
 	FuncName    string
 	FieldName   string
 	ParamName   string
@@ -153,10 +186,31 @@ type tpl struct {
 }
 
 var (
+	apiTpl = template.Must(template.New("apiTpl").Parse(`
+	type {{.ApiName}} struct{}
+	`))
+	serveTpl = template.Must(template.New("serveTpl").Parse(`
+	func (h *{{.ApiName}} ) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    switch r.URL.Path {
+    {{.Body}}
+    default:
+		apiError := ApiError{
+			HTTPStatus:  http.StatusNotFound,
+			err: errors.New("unknown method")
+		}
+        w.WriteHeader(apiError.HTTPStatus)
+		jsonRaw, _ := json.Marshal(apiError)
+		w.Write([]byte(jsonRaw))
+		return
+    }
+	`))
+	caseTpl = template.Must(template.New("caseTpl").Parse(`
+	// продолжим тут
+	// продолжим тут
+	`))
 	baseTpl = template.Must(template.New("baseTpl").Parse(`
 func {{.FuncName}}(w http.ResponseWriter, r *http.Request) {
 {{.Body}}
-	// some shit
 }
 `))
 	authCheck = `
@@ -178,12 +232,17 @@ func main() {
 
 	fmt.Fprintln(out, `package `+node.Name.Name)
 	fmt.Fprintln(out)
+	fmt.Fprintln(out, `// сгенеренный код`)
+	fmt.Fprintln(out)
 	fmt.Fprintln(out, `import "net/http"`)
 	fmt.Fprintln(out, `import "slices"`)
 	fmt.Fprintln(out, `import "errors"`)
+	fmt.Fprintln(out, `import "encoding/json"`)
 
 	var currentApiName string
 	var currentStructName string
+
+	validatorMap := make(map[string]string)
 
 	for _, f := range node.Decls {
 		switch g := f.(type) {
@@ -208,6 +267,8 @@ func main() {
 					apiValidatorText := "apivalidator:"
 
 					fmt.Println("Создаем валидатор для:", currentStructName)
+					methodName := strings.TrimSuffix(currentStructName, "Params")
+					validatorMap[strings.ToLower(methodName)] = currentStructName + "Validator"
 					OpenForm(out, currentStructName+"Validator", currentStructName)
 
 					for _, field := range currStruct.Fields.List {
@@ -299,17 +360,23 @@ func main() {
 			}
 
 			if needCodegen {
-				var auth string
+				var body string
 				if meta.Auth {
-					auth = authCheck
+					body = authCheck
 				} else {
-					auth = ""
+					body = ""
+				}
+
+				validatorName, ok := validatorMap[meta.Action]
+				if ok {
+					body += "err := " + validatorName + "(r)\n"
+					body += ApiErrorTemplate()
 				}
 
 				fmt.Println("Создаем хэндлер для:", currentApiName, meta.Entity, meta.Action)
 				baseTpl.Execute(out, tpl{
 					FuncName: ToCamelCase([]string{currentApiName, meta.Entity, meta.Action}),
-					Body:     auth,
+					Body:     body,
 				})
 			}
 		default:
