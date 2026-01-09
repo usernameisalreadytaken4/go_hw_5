@@ -77,6 +77,23 @@ func ApiErrorTemplate() string {
 	return buf.String()
 }
 
+func writeServeHTTP(out *os.File, currentApiName string, metaSlice []APIMeta) {
+	var cases string
+	for _, meta := range metaSlice {
+		var buf bytes.Buffer
+		caseTpl.Execute(&buf, tpl{
+			Body:     strconv.Quote(meta.URL),
+			FuncName: ToCamelCase([]string{meta.Entity, meta.Action}),
+		})
+		cases += string(buf.String())
+	}
+	serveTpl.Execute(out, tpl{
+		ApiName: currentApiName,
+		Body:    cases,
+	})
+	metaSlice = nil
+}
+
 type FieldMeta struct {
 	// * `required` - поле не должно быть пустым (не должно иметь значение по-умолчанию)
 	// * `paramname` - если указано - то брать из параметра с этим именем, иначе `lowercase` от имени
@@ -186,30 +203,49 @@ type tpl struct {
 }
 
 var (
-	apiTpl = template.Must(template.New("apiTpl").Parse(`
-	type {{.ApiName}} struct{}
+	importTpl = template.Must(template.New("importTpl").Parse(`
+import (
+	{{.Body}}
+)
 	`))
 	serveTpl = template.Must(template.New("serveTpl").Parse(`
-	func (h *{{.ApiName}} ) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *{{.ApiName}}) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     switch r.URL.Path {
     {{.Body}}
     default:
-		apiError := ApiError{
-			HTTPStatus:  http.StatusNotFound,
-			err: errors.New("unknown method")
+		err := ApiError{
+			HTTPStatus: http.StatusNotFound,
+			err: 		errors.New("unknown method")
 		}
         w.WriteHeader(apiError.HTTPStatus)
-		jsonRaw, _ := json.Marshal(apiError)
+		jsonRaw, _ := json.Marshal(err)
 		w.Write([]byte(jsonRaw))
 		return
     }
 	`))
 	caseTpl = template.Must(template.New("caseTpl").Parse(`
-	// продолжим тут
-	// продолжим тут
+	case {{.Body}}:
+		data, err := h.{{.FuncName}}(w, r)
+		if err != nil {
+			w.WriteHeader(err.HTTPStatus)
+			jsonRaw, _ := json.Marshal(err)
+			w.Write([]byte(jsonRaw))
+			return
+		}
+		resp := map[string]interface{
+			"error": "",
+			"response": data,
+		}
+		w.Header.Set("application/json")
+		w.WriteHeader(http.StatusOK)
+		err := json.NewEncoder(w).Encode(resp) 
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
 	`))
-	baseTpl = template.Must(template.New("baseTpl").Parse(`
-func {{.FuncName}}(w http.ResponseWriter, r *http.Request) {
+	methodTpl = template.Must(template.New("methodTpl").Parse(`
+func (h *{{.ApiName}}) {{.FuncName}}(w http.ResponseWriter, r *http.Request) {
 {{.Body}}
 }
 `))
@@ -232,19 +268,24 @@ func main() {
 
 	fmt.Fprintln(out, `package `+node.Name.Name)
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, `// сгенеренный код`)
-	fmt.Fprintln(out)
-	fmt.Fprintln(out, `import "net/http"`)
-	fmt.Fprintln(out, `import "slices"`)
-	fmt.Fprintln(out, `import "errors"`)
-	fmt.Fprintln(out, `import "encoding/json"`)
+
+	var importSlice []string
+	for _, name := range []string{"net/http", "slices", "errors", "encoding/json"} {
+		importSlice = append(importSlice, strconv.Quote(name))
+	}
+
+	importTpl.Execute(out, tpl{
+		Body: strings.Join(importSlice, "\n\t"),
+	})
 
 	var currentApiName string
 	var currentStructName string
 
 	validatorMap := make(map[string]string)
+	var metaSlice []APIMeta
 
 	for _, f := range node.Decls {
+
 		switch g := f.(type) {
 		case *ast.GenDecl:
 			for _, spec := range g.Specs {
@@ -259,6 +300,10 @@ func main() {
 					continue
 				}
 				if strings.Contains(strings.ToLower(currType.Name.Name), "api") {
+					if currentApiName != currType.Name.Name && len(metaSlice) > 0 {
+						// Новое API подразумевает, что закончили со старым
+						writeServeHTTP(out, currentApiName, metaSlice)
+					}
 					currentApiName = currType.Name.Name
 				} else {
 					currentStructName = currType.Name.Name
@@ -360,6 +405,7 @@ func main() {
 			}
 
 			if needCodegen {
+				metaSlice = append(metaSlice, meta)
 				var body string
 				if meta.Auth {
 					body = authCheck
@@ -369,13 +415,14 @@ func main() {
 
 				validatorName, ok := validatorMap[meta.Action]
 				if ok {
-					body += "err := " + validatorName + "(r)\n"
+					body += "\terr := " + validatorName + "(r)\n"
 					body += ApiErrorTemplate()
 				}
 
 				fmt.Println("Создаем хэндлер для:", currentApiName, meta.Entity, meta.Action)
-				baseTpl.Execute(out, tpl{
-					FuncName: ToCamelCase([]string{currentApiName, meta.Entity, meta.Action}),
+				methodTpl.Execute(out, tpl{
+					ApiName:  currentApiName,
+					FuncName: ToCamelCase([]string{meta.Entity, meta.Action}),
 					Body:     body,
 				})
 			}
@@ -383,5 +430,9 @@ func main() {
 			fmt.Printf("SKIP %#T is not *ast.GenDecl/*ast.FuncDecl\n", f)
 			continue
 		}
+	}
+	// последняя проверка
+	if len(metaSlice) > 0 {
+		writeServeHTTP(out, currentApiName, metaSlice)
 	}
 }
