@@ -37,18 +37,18 @@ type APIMeta struct {
 	Action string
 }
 
-func OpenForm(out *os.File, funcName string) {
+func OpenForm(out *os.File, funcName, structName string) {
 	template := template.Must(template.New("formTpl").Parse(`
-func {{.FuncName}}Validator(r *http.Request) (*{{.FuncName}}, error) {
-    var data {{.FuncName}}
+func {{.FuncName}}(r *http.Request) ({{.StructName}}, error) {
+    var data {{.StructName}}
 	`))
-	template.Execute(out, tpl{FuncName: funcName})
+	template.Execute(out, tpl{FuncName: funcName, StructName: structName})
 
 }
 
 func CloseForm(out *os.File) {
 	template := template.Must(template.New("formTpl").Parse(`
-	return &data, nil
+	return data, nil
 }
 	`))
 	template.Execute(out, tpl{})
@@ -60,9 +60,9 @@ type ApiError struct {
 	Err        error
 }
 
-func FillJobTemplate(funcName string) string {
+func FillJobTemplate(funcName, body string) string {
 	var buf bytes.Buffer
-	jobTemplate.Execute(&buf, tpl{FuncName: funcName})
+	jobTemplate.Execute(&buf, tpl{FuncName: funcName, Body: body})
 	return buf.String()
 }
 
@@ -80,7 +80,6 @@ func writeServeHTTP(out *os.File, currentApiName string, metaSlice []APIMeta) {
 		ApiName: currentApiName,
 		Body:    cases,
 	})
-	metaSlice = nil
 }
 
 type FieldMeta struct {
@@ -107,7 +106,7 @@ func (field *FieldMeta) RequiredCheck(out *os.File) {
 	// required
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if data.{{.FieldName}} == "" {
-		return nil, &ApiError{
+		return data, &ApiError{
 			HTTPStatus: http.StatusBadRequest,
 			Err: errors.New("{{.ParamName}} must me not empty"),
 		}
@@ -128,7 +127,7 @@ func (field *FieldMeta) EnumCheck(out *os.File) {
 	enums := []string{"{{.Body}}"}
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if !slices.Contains(enums, data.{{.FieldName}}) {
-		return nil, &ApiError{
+		return data, &ApiError{
 			HTTPStatus: http.StatusBadRequest,
 			Err: errors.New("{{.ParamName}} must be one of [{{.Body}}]"),
 		}
@@ -167,7 +166,7 @@ func (field *FieldMeta) MinMaxCheck(out *os.File, op string, limit int) {
 	// min/max
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if data.{{.FieldName}} != "" && len(data.{{.FieldName}}) {{.Body}} {{.IntValue}} {
-	    return nil, &ApiError{
+	    return data, &ApiError{
 			HTTPStatus: http.StatusBadRequest,
 			Err: 		errors.New()"{{.ParamName}} must be {{.Body}}= {{.IntValue}}"),
 		}
@@ -196,6 +195,7 @@ func (field *FieldMeta) MaxCheck(out *os.File) {
 type tpl struct {
 	ApiName     string
 	FuncName    string
+	StructName  string
 	FieldName   string
 	ParamName   string
 	Body        string
@@ -234,7 +234,10 @@ func (h *{{.ApiName}}) {{.FuncName}}(w http.ResponseWriter, r *http.Request){
 }
 `))
 	jobTemplate = template.Must(template.New("jobTpl").Parse(`
-	in, err := {{.FuncName}}ParamsValidator(r)
+	resp := map[string]interface{}{
+		"error": "unknown method",
+	}
+	in, err := {{.Body}}(r)
 	if err != nil {
 		resp["error"] = err.Error()
 		if apiErr, ok := err.(ApiError); ok {
@@ -248,6 +251,7 @@ func (h *{{.ApiName}}) {{.FuncName}}(w http.ResponseWriter, r *http.Request){
 		return
 	}
 
+	ctx := r.Context()
 	data, err := h.{{.FuncName}}(ctx, in)
 	if err != nil {
 		resp["error"] = err.Error()
@@ -326,6 +330,7 @@ func main() {
 					if currentApiName != currType.Name.Name && len(metaSlice) > 0 {
 						// Новое API подразумевает, что закончили со старым
 						writeServeHTTP(out, currentApiName, metaSlice)
+						metaSlice = nil
 					}
 					currentApiName = currType.Name.Name
 				} else {
@@ -337,7 +342,7 @@ func main() {
 					fmt.Println("Создаем валидатор для:", currentStructName)
 					methodName := strings.TrimSuffix(currentStructName, "Params")
 					validatorMap[strings.ToLower(methodName)] = currentStructName + "Validator"
-					OpenForm(out, currentStructName)
+					OpenForm(out, ToCamelCase([]string{currentStructName, "Validator"}), currentStructName)
 
 					for _, field := range currStruct.Fields.List {
 						fieldName := field.Names[0].Name
@@ -349,10 +354,10 @@ func main() {
 							fieldMeta := FieldMeta{}
 							fieldMeta.Name = fieldName
 							fieldMeta.ParamName = fieldName
+
 							for _, param := range params {
 								if param == "required" {
 									fieldMeta.Required = true
-									fieldMeta.RequiredCheck(out)
 								}
 
 								if strings.Contains(param, "=") {
@@ -383,12 +388,14 @@ func main() {
 
 										}
 									}
-									fieldMeta.DefaultCheck(out)
-									fieldMeta.EnumCheck(out)
-									fieldMeta.MaxCheck(out)
-									fieldMeta.MinCheck(out)
 								}
+
 							}
+							fieldMeta.RequiredCheck(out)
+							fieldMeta.DefaultCheck(out)
+							fieldMeta.EnumCheck(out)
+							fieldMeta.MaxCheck(out)
+							fieldMeta.MinCheck(out)
 
 						}
 					}
@@ -435,7 +442,13 @@ func main() {
 					body = ""
 				}
 				fmt.Println(meta)
-				body += FillJobTemplate(ToCamelCase([]string{meta.Action}))
+				apiSuffix := strings.Trim(currentApiName, "Api")
+				if apiSuffix == "My" {
+					apiSuffix = ToCamelCase([]string{validatorMap[meta.Action]})
+				} else {
+					apiSuffix = ToCamelCase([]string{apiSuffix, validatorMap[meta.Action]})
+				}
+				body += FillJobTemplate(ToCamelCase([]string{meta.Action}), apiSuffix)
 
 				fmt.Println("Создаем хэндлер для:", currentApiName, meta.Entity, meta.Action)
 				methodTpl.Execute(out, tpl{
