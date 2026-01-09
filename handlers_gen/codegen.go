@@ -37,18 +37,18 @@ type APIMeta struct {
 	Action string
 }
 
-func OpenForm(out *os.File, funcName, structName string) {
+func OpenForm(out *os.File, funcName string) {
 	template := template.Must(template.New("formTpl").Parse(`
-func {{.FuncName}}(r *http.Request) error {
-    var data {{.Body}}
+func {{.FuncName}}Validator(r *http.Request) (*{{.FuncName}}, error) {
+    var data {{.FuncName}}
 	`))
-	template.Execute(out, tpl{FuncName: funcName, Body: structName})
+	template.Execute(out, tpl{FuncName: funcName})
 
 }
 
 func CloseForm(out *os.File) {
 	template := template.Must(template.New("formTpl").Parse(`
-	return nil
+	return &data, nil
 }
 	`))
 	template.Execute(out, tpl{})
@@ -60,20 +60,9 @@ type ApiError struct {
 	Err        error
 }
 
-func ApiErrorTemplate() string {
-	template := template.Must(template.New("apiErrorTpl").Parse(`
-	if err != nil {
-		apiError, ok := err.(ApiError)
-		if ok {
-			w.WriteHeader(apiError.HTTPStatus)
-			jsonRaw, _ := json.Marshal(err)
-			w.Write([]byte(jsonRaw))
-			return
-		}
-	}
-	`))
+func FillJobTemplate(funcName string) string {
 	var buf bytes.Buffer
-	template.Execute(&buf, nil)
+	jobTemplate.Execute(&buf, tpl{FuncName: funcName})
 	return buf.String()
 }
 
@@ -111,11 +100,14 @@ type FieldMeta struct {
 }
 
 func (field *FieldMeta) RequiredCheck(out *os.File) {
+	if !field.Required {
+		return
+	}
 	template := template.Must(template.New("requiredFieldTpl").Parse(`
 	// required
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if data.{{.FieldName}} == "" {
-		return ApiError{
+		return nil, &ApiError{
 			HTTPStatus: http.StatusBadRequest,
 			Err: errors.New("{{.ParamName}} must me not empty"),
 		}
@@ -128,12 +120,15 @@ func (field *FieldMeta) RequiredCheck(out *os.File) {
 }
 
 func (field *FieldMeta) EnumCheck(out *os.File) {
+	if len(field.Enum) == 0 {
+		return
+	}
 	template := template.Must(template.New("enumFieldTpl").Parse(`
 	// enum
 	enums := []string{"{{.Body}}"}
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if !slices.Contains(enums, data.{{.FieldName}}) {
-		return ApiError{
+		return nil, &ApiError{
 			HTTPStatus: http.StatusBadRequest,
 			Err: errors.New("{{.ParamName}} must be one of [{{.Body}}]"),
 		}
@@ -147,6 +142,9 @@ func (field *FieldMeta) EnumCheck(out *os.File) {
 }
 
 func (field *FieldMeta) DefaultCheck(out *os.File) {
+	if field.Default == "" {
+		return
+	}
 	template := template.Must(template.New("defaultFieldTpl").Parse(`
 	// default
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
@@ -162,13 +160,16 @@ func (field *FieldMeta) DefaultCheck(out *os.File) {
 }
 
 func (field *FieldMeta) MinMaxCheck(out *os.File, op string, limit int) {
+	if limit == 0 {
+		return
+	}
 	template := template.Must(template.New("minMaxFieldTpl").Parse(`
 	// min/max
 	data.{{.FieldName}} = r.URL.Query().Get("{{.ParamName}}")
 	if data.{{.FieldName}} != "" && len(data.{{.FieldName}}) {{.Body}} {{.IntValue}} {
-	    return ApiError{
+	    return nil, &ApiError{
 			HTTPStatus: http.StatusBadRequest,
-			Err: errors.New()"{{.ParamName}} must be {{.Body}}= {{.IntValue}}"),
+			Err: 		errors.New()"{{.ParamName}} must be {{.Body}}= {{.IntValue}}"),
 		}
 	}
 	`))
@@ -213,42 +214,64 @@ func (h *{{.ApiName}}) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     switch r.URL.Path {
     {{.Body}}
     default:
-		err := ApiError{
-			HTTPStatus: http.StatusNotFound,
-			err: 		errors.New("unknown method")
+		resp := map[string]interface{}{
+			"error": "unknown method",
 		}
-        w.WriteHeader(apiError.HTTPStatus)
-		jsonRaw, _ := json.Marshal(err)
-		w.Write([]byte(jsonRaw))
+        w.WriteHeader(http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
 		return
     }
+}
 	`))
 	caseTpl = template.Must(template.New("caseTpl").Parse(`
 	case {{.Body}}:
-		data, err := h.{{.FuncName}}(w, r)
-		if err != nil {
-			w.WriteHeader(err.HTTPStatus)
-			jsonRaw, _ := json.Marshal(err)
-			w.Write([]byte(jsonRaw))
-			return
-		}
-		resp := map[string]interface{
-			"error": "",
-			"response": data,
-		}
-		w.Header.Set("application/json")
-		w.WriteHeader(http.StatusOK)
-		err := json.NewEncoder(w).Encode(resp) 
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return
+		h.{{.FuncName}}(w, r)
 	`))
 	methodTpl = template.Must(template.New("methodTpl").Parse(`
-func (h *{{.ApiName}}) {{.FuncName}}(w http.ResponseWriter, r *http.Request) {
+func (h *{{.ApiName}}) {{.FuncName}}(w http.ResponseWriter, r *http.Request){
 {{.Body}}
 }
 `))
+	jobTemplate = template.Must(template.New("jobTpl").Parse(`
+	in, err := {{.FuncName}}ParamsValidator(r)
+	if err != nil {
+		resp["error"] = err.Error()
+		if apiErr, ok := err.(ApiError); ok {
+			w.WriteHeader(apiErr.HTTPStatus)
+		} else {
+			resp["error"] = err.Error()
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		jsonRaw, _ := json.Marshal(resp)
+		w.Write([]byte(jsonRaw))
+		return
+	}
+
+	data, err := h.{{.FuncName}}(ctx, in)
+	if err != nil {
+		resp["error"] = err.Error()
+		if apiErr, ok := err.(ApiError); ok {
+			w.WriteHeader(apiErr.HTTPStatus)
+		} else {
+			resp["error"] = err.Error()
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		jsonRaw, _ := json.Marshal(resp)
+		w.Write([]byte(jsonRaw))
+		return
+	}
+	resp["response"] = data
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	err = json.NewEncoder(w).Encode(resp) 
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	return
+
+	`))
 	authCheck = `
 	auth := r.Header.Get("X-Auth")
 	if auth != "100500" {
@@ -314,7 +337,7 @@ func main() {
 					fmt.Println("Создаем валидатор для:", currentStructName)
 					methodName := strings.TrimSuffix(currentStructName, "Params")
 					validatorMap[strings.ToLower(methodName)] = currentStructName + "Validator"
-					OpenForm(out, currentStructName+"Validator", currentStructName)
+					OpenForm(out, currentStructName)
 
 					for _, field := range currStruct.Fields.List {
 						fieldName := field.Names[0].Name
@@ -337,34 +360,33 @@ func main() {
 									if len(paramSlice) == 2 {
 										if paramSlice[0] == "default" {
 											fieldMeta.Default = paramSlice[1]
-											fieldMeta.DefaultCheck(out)
 
 										}
 										if paramSlice[0] == "enum" {
 											fieldMeta.Enum = strings.Split(paramSlice[1], "|")
-											fieldMeta.EnumCheck(out)
 
 										}
 										if paramSlice[0] == "max" {
 											value, err := strconv.Atoi(paramSlice[1])
 											if err != nil {
 												fieldMeta.Max = value
-												fieldMeta.MaxCheck(out)
 											}
 										}
 										if paramSlice[0] == "min" {
 											value, err := strconv.Atoi(paramSlice[1])
 											if err != nil {
 												fieldMeta.Min = value
-												fieldMeta.MinCheck(out)
 											}
 										}
 										if paramSlice[0] == "paramname" {
 											fieldMeta.ParamName = paramSlice[1]
 
 										}
-
 									}
+									fieldMeta.DefaultCheck(out)
+									fieldMeta.EnumCheck(out)
+									fieldMeta.MaxCheck(out)
+									fieldMeta.MinCheck(out)
 								}
 							}
 
@@ -412,12 +434,8 @@ func main() {
 				} else {
 					body = ""
 				}
-
-				validatorName, ok := validatorMap[meta.Action]
-				if ok {
-					body += "\terr := " + validatorName + "(r)\n"
-					body += ApiErrorTemplate()
-				}
+				fmt.Println(meta)
+				body += FillJobTemplate(ToCamelCase([]string{meta.Action}))
 
 				fmt.Println("Создаем хэндлер для:", currentApiName, meta.Entity, meta.Action)
 				methodTpl.Execute(out, tpl{
